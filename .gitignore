@@ -1,5 +1,14 @@
+# Ignore datasets and zip files
+data/
+*.zip
+*.tar.gz
+
+# Ignore processed data & trained model binaries
+data/processed/
+models/*.pkl
+models/*.h5
+
+# Ignore virtual environments
 venv/
+.venv/
 __pycache__/
-.ipynb_checkpoints/
-*.pyc
-.env
