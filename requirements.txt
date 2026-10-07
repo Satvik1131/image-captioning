@@ -1,0 +1,34 @@
+# ============================================================
+# Image Captioning Project — Dependencies
+# VGG16 (CNN Encoder) + LSTM (RNN Decoder) on Flickr8k
+# ============================================================
+
+# Core deep learning framework (Unit II, IV, V)
+tensorflow==2.21.0       # TensorFlow + Keras: VGG16, LSTM, Adam, Cross-Entropy
+
+# Numerical computing — array ops, feature matrix manipulation
+numpy==2.4.6
+
+# Image loading and resizing for VGG16 preprocessing (Unit IV)
+Pillow==12.3.0           # PIL: load .jpg images, resize to 224x224
+
+# Progress bars for feature extraction loop (nice-to-have)
+tqdm                     # shows progress during VGG16 feature extraction
+
+# Evaluation metric: BLEU score (Unit V — sequence evaluation)
+nltk                     # Natural Language Toolkit: corpus_bleu()
+
+# Optional: BLEU/ROUGE scoring utilities
+scikit-learn             # train/val split helpers (train_test_split)
+
+# Optional: read images with OpenCV if PIL fails
+opencv-python            # cv2: alternative image loading
+
+# Visualisation — loss/accuracy curves, image display
+matplotlib==3.11.2
+
+# Web UI (Streamlit app — app/app.py)
+streamlit==1.64.0
+
+# Model weights storage format
+h5py==3.14.0             # HDF5: saves Keras model weights (.h5 files)
