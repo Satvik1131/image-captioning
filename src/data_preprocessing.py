@@ -15,26 +15,41 @@ The tokenizer converts it to integer indices:
 
 We then generate ONE training sample per word step:
 
-  Step | Image Feature | Input Sequence (padded)    | Target Word (one-hot)
-  ─────┼───────────────┼────────────────────────────┼──────────────────────
-   1   | VGG16 (512,)  | [1, 0, 0, 0, 0, ...]       | "a"     → index 5
-   2   | VGG16 (512,)  | [1, 5, 0, 0, 0, ...]       | "dog"   → index 42
-   3   | VGG16 (512,)  | [1, 5, 42, 0, 0, ...]      | "runs"  → index 87
-   4   | VGG16 (512,)  | [1, 5, 42, 87, 0, ...]     | "endseq"→ index 2
+  Step | Image Feature  | Input Sequence (padded)     | Target (integer)
+  ─────┼────────────────┼─────────────────────────────┼──────────────────
+   1   | VGG16 (4096,)  | [1, 0, 0, 0, 0, ...]        | 5  ("a")
+   2   | VGG16 (4096,)  | [1, 5, 0, 0, 0, ...]        | 42 ("dog")
+   3   | VGG16 (4096,)  | [1, 5, 42, 0, 0, ...]       | 87 ("runs")
+   4   | VGG16 (4096,)  | [1, 5, 42, 87, 0, ...]      | 2  ("endseq")
 
-This is called "teacher forcing": at each step the model sees the TRUE
-previous words (not its own predictions), which stabilises training.
+WHY SPARSE INTEGER TARGETS (not one-hot)?
+──────────────────────────────────────────
+The original code used to_categorical() to create one-hot vectors of shape
+(vocab_size,). With vocab_size ~3000-4000 and ~400k samples, storing all
+one-hot targets would require:
 
-The target word is converted to a ONE-HOT vector of length vocab_size.
-The model's softmax output is compared to this one-hot via Cross-Entropy loss.
+    400,000 × 4000 × 4 bytes ≈ 6.4 GB
 
-For 8091 images × 5 captions × ~10 words each ≈ 400,000 training samples.
-Loading all of these into RAM at once would require several GB.
-Instead, a GENERATOR yields batches lazily — only batch_size samples live
-in memory at any moment.
+Sparse targets store just the integer index (1 value per sample):
+
+    400,000 × 1 × 4 bytes ≈ 1.6 MB
+
+Keras sparse_categorical_crossentropy accepts integer targets directly and
+computes the same loss as categorical_crossentropy(one_hot). No information
+is lost — this is purely a memory optimisation.
+
+WHY SHUFFLE IN THE GENERATOR?
+───────────────────────────────
+Without shuffling, each batch of 64 samples comes from 1–2 images (because
+one image generates ~50 samples). Correlated batches mean the gradient updates
+are biased toward whatever patterns the first few images have, and the model
+quickly learns to ignore the image features and output the most common language
+patterns. Shuffling across a buffer of ~100 images ensures that every batch
+is a diverse mixture of images → gradients contain varied visual signals →
+the model is forced to condition its predictions on the image.
 
 Syllabus Alignment:
-    - Unit II  : One-hot target vectors feed into Categorical Cross-Entropy
+    - Unit II  : Sparse Cross-Entropy loss (vs. one-hot Categorical)
     - Unit V   : Sequence-to-sequence modelling, teacher forcing
     - Unit III : Batch-wise training via generator (memory management)
 """
@@ -42,10 +57,10 @@ Syllabus Alignment:
 import os
 import json
 import pickle
+import random
 import numpy as np
 
-from tensorflow.keras.preprocessing.sequence import pad_sequences  # pads integer sequences
-from tensorflow.keras.utils import to_categorical                   # integer → one-hot vector
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -55,6 +70,9 @@ PROJECT_ROOT        = os.path.abspath(os.path.join(os.path.dirname(__file__), ".
 CLEAN_CAPTIONS_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "clean_captions.json")
 FEATURES_PATH       = os.path.join(PROJECT_ROOT, "data", "processed", "features.pkl")
 TOKENIZER_PATH      = os.path.join(PROJECT_ROOT, "models", "tokenizer.pkl")
+
+BATCH_SIZE = 64     # Larger than original 32 — amortises per-batch overhead
+                    # and provides more diverse image mixing per gradient step.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,14 +99,16 @@ def load_clean_captions(path):
 
 def load_features(path):
     """
-    Load the pre-extracted VGG16 feature dictionary from pickle.
+    Load the pre-extracted VGG16 fc2 feature dictionary from pickle.
 
     Returns:
-        dict: { "image_filename.jpg": np.array of shape (512,) }
+        dict: { "image_filename.jpg": np.array of shape (4096,) }
+              All vectors are L2-normalised (unit sphere).
     """
     with open(path, "rb") as f:
         features = pickle.load(f)
-    print(f"[load] Loaded features for {len(features)} images.")
+    sample_shape = next(iter(features.values())).shape
+    print(f"[load] Loaded features for {len(features)} images. Shape: {sample_shape}")
     return features
 
 
@@ -99,10 +119,6 @@ def load_features(path):
 def load_tokenizer(path):
     """
     Load the fitted Keras Tokenizer from pickle.
-
-    The tokenizer provides:
-        tokenizer.word_index  — { "startseq":1, "a":2, "dog":3, ... }
-        tokenizer.texts_to_sequences(["startseq a dog"]) → [[1, 2, 3]]
 
     Returns:
         tokenizer: Fitted Keras Tokenizer object.
@@ -121,31 +137,19 @@ def get_max_length(captions_dict):
     """
     Compute the maximum caption length (in tokens) across all captions.
 
-    This is used to determine the padding length for all input sequences.
-    Every input sequence is padded (or truncated) to exactly this length
-    so that all training samples have a uniform shape for batching.
-
-    Why do we need a fixed length?
-        Numpy arrays and Keras models require fixed-size tensors.
-        pad_sequences() adds zeros (index 0) to shorter sequences
-        from the LEFT by default (post-padding also available).
+    Used to determine the padding length for all input sequences.
 
     Args:
         captions_dict (dict): { image_id: [caption_string, ...] }
 
     Returns:
         int: The maximum number of tokens in any single caption.
-
-    Example:
-        "startseq a dog runs endseq" → 5 tokens
-        max_length = max over all such lengths
     """
-    all_lengths = []
-    for captions_list in captions_dict.values():
-        for caption in captions_list:
-            all_lengths.append(len(caption.split()))  # count space-separated tokens
-
-    max_len = max(all_lengths)
+    max_len = max(
+        len(cap.split())
+        for caps in captions_dict.values()
+        for cap in caps
+    )
     print(f"[utils] Computed max caption length: {max_len} tokens")
     return max_len
 
@@ -154,195 +158,170 @@ def get_max_length(captions_dict):
 # FUNCTION 5 — create_sequences
 # ──────────────────────────────────────────────────────────────────────────────
 
-def create_sequences(tokenizer, max_length, captions_list, feature_vector, vocab_size):
+def create_sequences(tokenizer, max_length, captions_list, feature_vector):
     """
     Generate all (image_feature, input_sequence, target_word) triples
     for ONE image and its list of captions.
 
-    This is the core of teacher-forcing sequence generation:
+    SPARSE TARGET FORMAT:
+        target is a plain integer index, NOT a one-hot vector.
+        This is used with loss='sparse_categorical_crossentropy'.
 
-    For each caption in captions_list:
-        1. Convert the caption string to an integer sequence using the tokenizer.
-           e.g. "startseq a dog runs endseq"  →  [1, 5, 42, 87, 2]
-
-        2. For each position i in the sequence (except the last):
-              input_seq  = all tokens UP TO position i (the "context")
-              target_idx = the token AT position i+1 (the "next word to predict")
-
-           So for [1, 5, 42, 87, 2]:
-              Step 1: in=[1],          target=5   ("a")
-              Step 2: in=[1,5],        target=42  ("dog")
-              Step 3: in=[1,5,42],     target=87  ("runs")
-              Step 4: in=[1,5,42,87],  target=2   ("endseq")
-
-        3. Pad input_seq to max_length using POST-padding (zeros on the right).
-           Turns [1, 5] → [1, 5, 0, 0, 0, ..., 0]  (length = max_length)
-
-        4. Convert target_idx to a one-hot vector of length vocab_size.
-           target=5 → [0,0,0,0,0,1,0,...,0]  (1 at position 5, 0 elsewhere)
+    For each caption, for each word step i:
+        in_seq  = seq[0:i]     padded post → (max_length,)
+        target  = seq[i]       integer index (e.g. 42 for "dog")
 
     Args:
-        tokenizer       : Fitted Keras Tokenizer with word_index populated.
-        max_length (int): All input sequences padded to this fixed length.
+        tokenizer       : Fitted Keras Tokenizer.
+        max_length (int): All input sequences padded to this length.
         captions_list   : List of cleaned caption strings for one image.
-                          e.g. ["startseq a dog runs endseq", ...]
-        feature_vector  : np.array of shape (512,) — VGG16 features for this image.
-        vocab_size (int): Total vocabulary size (for one-hot encoding).
+        feature_vector  : np.array of shape (4096,) — VGG16 fc2 features.
 
     Returns:
-        X1 (np.array): Image features,    shape (num_samples, 512)
+        X1 (np.array): Image features,    shape (num_samples, 4096)
         X2 (np.array): Input sequences,   shape (num_samples, max_length)
-        y  (np.array): One-hot targets,   shape (num_samples, vocab_size)
-
-    where num_samples = total word-steps across all captions for this image
-    (roughly 5 captions × avg_caption_length words).
+        y  (np.array): Sparse int targets, shape (num_samples,)
     """
-    X1 = []  # image feature vectors (one copy per word-step)
-    X2 = []  # padded partial caption sequences (growing prefix)
-    y  = []  # one-hot encoded target word (next word to predict)
+    X1 = []
+    X2 = []
+    y  = []
 
     for caption in captions_list:
-        # Step 1: Convert caption string → list of integer indices
-        # texts_to_sequences wraps input in a list, returns list of lists
-        # e.g. "startseq a dog" → [[1, 5, 42]]  → we take [0] to get [1, 5, 42]
         seq = tokenizer.texts_to_sequences([caption])[0]
-        # seq is now a list of ints, e.g. [1, 5, 42, 87, 2]
 
-        # Step 2: Generate one training sample per word position
-        # We iterate from index 1 to len(seq) so that:
-        #   - input  = seq[0 : i]     (everything seen so far)
-        #   - target = seq[i]         (the next word to predict)
         for i in range(1, len(seq)):
+            in_seq     = seq[:i]
+            target_idx = seq[i]
 
-            # Input: the partial caption seen so far (prefix of length i)
-            in_seq = seq[:i]   # e.g. i=2 → [1, 5]  ("startseq a")
-
-            # Target: the next word (single integer index)
-            target_idx = seq[i]    # e.g. seq[2] = 42  ("dog")
-
-            # Step 3: Pad the input sequence to max_length
-            # pad_sequences expects a list of sequences; we pass a list of one
-            # maxlen=max_length: if len(in_seq) < max_length → pad with 0s
-            # padding='post': zeros go at the END → [1, 5, 0, 0, ..., 0]
-            # (post-padding works better with mask_zero=True in the Embedding layer)
+            # Post-pad to max_length (must match inference padding)
             in_seq_padded = pad_sequences(
-                [in_seq],           # list of one sequence
-                maxlen=max_length,  # target fixed length
-                padding='post'      # zeros appended at the end
+                [in_seq],
+                maxlen=max_length,
+                padding='post'
             )[0]
-            # in_seq_padded shape: (max_length,)  e.g. (37,)
 
-            # Step 4: One-hot encode the target word index
-            # to_categorical(5, num_classes=8769) → array of 8769 zeros with a 1 at index 5
-            # Shape: (vocab_size,)
-            target_one_hot = to_categorical(
-                [target_idx],       # single integer index
-                num_classes=vocab_size
-            )[0]
-            # target_one_hot shape: (vocab_size,)  e.g. (8769,)
+            X1.append(feature_vector)    # (4096,)
+            X2.append(in_seq_padded)     # (max_length,)
+            y.append(target_idx)         # integer — sparse label
 
-            # Accumulate this training sample
-            X1.append(feature_vector)    # same image feature repeated for each word step
-            X2.append(in_seq_padded)     # growing prefix sequence, padded
-            y.append(target_one_hot)     # one-hot next word
-
-    # Convert lists to numpy arrays for Keras
-    X1 = np.array(X1)   # shape: (num_samples, 512)
-    X2 = np.array(X2)   # shape: (num_samples, max_length)
-    y  = np.array(y)    # shape: (num_samples, vocab_size)
+    X1 = np.array(X1)           # shape: (num_samples, 4096)
+    X2 = np.array(X2)           # shape: (num_samples, max_length)
+    y  = np.array(y,  dtype=np.int32)  # shape: (num_samples,) — sparse int
 
     return X1, X2, y
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FUNCTION 6 — data_generator
+# FUNCTION 6 — data_generator  (SHUFFLED + BUFFERED)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def data_generator(captions_dict, features_dict, tokenizer, max_length,
-                   vocab_size, batch_size=32):
+                   vocab_size, batch_size=BATCH_SIZE, buffer_images=100):
     """
-    A Python GENERATOR that yields training batches on-the-fly.
+    A Python GENERATOR that yields training batches on-the-fly,
+    with per-epoch shuffling and within-buffer sample shuffling.
 
-    WHY A GENERATOR? (Important for viva)
-    ────────────────────────────────────────
-    If we called create_sequences() for ALL 8091 images at once and stored
-    the results in RAM, we'd need approximately:
+    SHUFFLING STRATEGY:
+    ────────────────────
+    1. EPOCH-LEVEL SHUFFLE:
+       At the start of every pass through the image list, shuffle the list
+       of image IDs. This ensures that different random orderings of images
+       are seen each epoch, preventing the model from memorising the fixed
+       ordering.
 
-        8091 images × 5 captions × ~10 word steps = ~400,000 samples
-        Per sample: 512 (X1) + 37 (X2) + 8769 (y) floats
-        Total: ~400,000 × 9,318 × 4 bytes ≈ 14.9 GB of RAM
+    2. BUFFER SHUFFLE:
+       Collect samples from `buffer_images` images into a buffer, then
+       shuffle that buffer before yielding batches from it. Because one
+       image contributes ~50 samples, a buffer of 100 images contains
+       ~5000 samples from ~100 different images. Each batch of 64 drawn
+       from this buffer is therefore guaranteed to contain samples from
+       many different images → diverse gradient signal.
 
-    That would crash any normal laptop/desktop.
+    MEMORY:
+       Only buffer_images × ~50 samples live in RAM at once.
+       (~100 images × 50 × (4096 + max_len + 1) × 4 bytes ≈ 80 MB)
 
-    A generator instead:
-        1. Processes ONE IMAGE at a time.
-        2. Accumulates its samples into a growing batch buffer.
-        3. Once the buffer reaches batch_size samples, it YIELDS the batch.
-        4. Execution pauses at 'yield', Keras uses the batch for one gradient update,
-           then resumes — the buffer is cleared and we continue with the next image.
-
-    This keeps memory usage constant at:
-        batch_size × (512 + 37 + 8769) × 4 bytes ≈ a few MB regardless of dataset size.
-
-    Keras model.fit() accepts generators directly via the 'generator' argument
-    and the 'steps_per_epoch' parameter (how many yield calls = 1 epoch).
+    SPARSE TARGETS:
+       y_batch has shape (batch_size,) with dtype int32 — compatible with
+       sparse_categorical_crossentropy. No one-hot expansion needed.
 
     Args:
-        captions_dict (dict): { image_id: [caption_string, ...] }
-        features_dict (dict): { image_id: np.array(512,) }
-        tokenizer           : Fitted Keras Tokenizer
-        max_length (int)    : Fixed sequence length for padding
-        vocab_size (int)    : Vocabulary size for one-hot encoding
-        batch_size (int)    : Number of training samples per yielded batch
+        captions_dict  (dict) : { image_id: [captions] }
+        features_dict  (dict) : { image_id: np.array(4096,) }
+        tokenizer             : Fitted Keras Tokenizer
+        max_length (int)      : Fixed sequence length for padding
+        vocab_size (int)      : Vocabulary size (kept for API compatibility)
+        batch_size (int)      : Samples per yielded batch
+        buffer_images (int)   : Number of images to buffer before shuffling
 
     Yields:
-        ([X1_batch, X2_batch], y_batch) — exactly what Keras model.fit() expects
-            X1_batch shape: (batch_size, 512)
-            X2_batch shape: (batch_size, max_length)
-            y_batch  shape: (batch_size, vocab_size)
+        ({'image_input': X1, 'seq_input': X2}, y) batches, where:
+            X1 shape : (batch_size, 4096)
+            X2 shape : (batch_size, max_length)
+            y  shape : (batch_size,)  — sparse integer labels
     """
-    # Accumulators for the current batch
-    X1_batch = []
-    X2_batch = []
-    y_batch  = []
+    # Build a mutable list of image IDs that have both captions and features
+    all_ids = [img_id for img_id in captions_dict if img_id in features_dict]
 
     while True:
-        # Keras generators must loop FOREVER (while True) —
-        # model.fit() controls when to stop via steps_per_epoch and epochs.
-        for image_id, captions_list in captions_dict.items():
+        # ── Epoch-level shuffle: randomise image order every pass ─────────────
+        random.shuffle(all_ids)
 
-            # Skip images that have no extracted features
-            # (e.g. if an image file was missing during feature extraction)
-            if image_id not in features_dict:
-                continue
+        # ── Buffer: collect samples from buffer_images images, then shuffle ───
+        buf_X1, buf_X2, buf_y = [], [], []
 
-            feature_vector = features_dict[image_id]  # shape: (512,)
+        for image_id in all_ids:
+            feature_vector = features_dict[image_id]   # (4096,)
+            captions_list  = captions_dict[image_id]
 
-            # Generate all (X1, X2, y) triples for this one image
             X1, X2, y = create_sequences(
-                tokenizer, max_length, captions_list, feature_vector, vocab_size
+                tokenizer, max_length, captions_list, feature_vector
             )
 
-            # Add each sample from this image into the current batch buffer
-            for j in range(len(X1)):
-                X1_batch.append(X1[j])   # (512,)
-                X2_batch.append(X2[j])   # (max_length,)
-                y_batch.append(y[j])     # (vocab_size,)
+            buf_X1.extend(X1)
+            buf_X2.extend(X2)
+            buf_y.extend(y)
 
-                # Once we've accumulated batch_size samples — YIELD the batch
-                if len(X1_batch) == batch_size:
+            # Once the buffer is large enough, shuffle and yield batches
+            if len(buf_X1) >= buffer_images * 50:
+                # Shuffle indices within the buffer for within-buffer mixing
+                indices = list(range(len(buf_X1)))
+                random.shuffle(indices)
 
-                    # Convert to numpy and yield
+                buf_X1_arr = np.array(buf_X1)[indices]
+                buf_X2_arr = np.array(buf_X2)[indices]
+                buf_y_arr  = np.array(buf_y,  dtype=np.int32)[indices]
+
+                # Yield batches from the shuffled buffer
+                for start in range(0, len(buf_X1_arr) - batch_size + 1, batch_size):
+                    end = start + batch_size
                     yield (
-                        [np.array(X1_batch),   # shape: (batch_size, 512)
-                         np.array(X2_batch)],  # shape: (batch_size, max_length)
-                        np.array(y_batch)       # shape: (batch_size, vocab_size)
+                        (buf_X1_arr[start:end],    # (batch_size, 4096)
+                         buf_X2_arr[start:end]),   # (batch_size, max_length)
+                        buf_y_arr[start:end]        # (batch_size,) — sparse int
                     )
 
-                    # Clear the buffer for the next batch
-                    X1_batch = []
-                    X2_batch = []
-                    y_batch  = []
+                # Clear buffer
+                buf_X1, buf_X2, buf_y = [], [], []
+
+        # ── Flush any remaining samples in the buffer ─────────────────────────
+        if buf_X1:
+            indices = list(range(len(buf_X1)))
+            random.shuffle(indices)
+
+            buf_X1_arr = np.array(buf_X1)[indices]
+            buf_X2_arr = np.array(buf_X2)[indices]
+            buf_y_arr  = np.array(buf_y, dtype=np.int32)[indices]
+
+            for start in range(0, len(buf_X1_arr) - batch_size + 1, batch_size):
+                end = start + batch_size
+                yield (
+                    (buf_X1_arr[start:end],
+                     buf_X2_arr[start:end]),
+                    buf_y_arr[start:end]
+                )
+
+            buf_X1, buf_X2, buf_y = [], [], []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -355,36 +334,28 @@ def get_train_val_split(captions_dict, features_dict, val_split=0.1):
 
     We split on IMAGE IDs (not individual captions) to ensure that all 5
     captions of a given image are either ALL in train or ALL in val.
-    This prevents data leakage (where the model sees test images during training).
+    This prevents data leakage.
 
     Args:
         captions_dict (dict): Full { image_id: [captions] } dict.
         features_dict (dict): Full { image_id: feature_vector } dict.
-        val_split     (float): Fraction of images to use for validation.
-                               Default 0.1 = 10% val, 90% train.
+        val_split (float)   : Fraction of images for validation. Default 0.1.
 
     Returns:
-        train_captions (dict): { image_id: [captions] } for training
-        val_captions   (dict): { image_id: [captions] } for validation
-        train_features (dict): { image_id: feature } for training
-        val_features   (dict): { image_id: feature } for validation
+        train_captions, val_captions, train_features, val_features (dicts)
     """
-    # Only use image IDs that have BOTH captions AND features
     common_ids = [
         img_id for img_id in captions_dict
         if img_id in features_dict
     ]
 
-    # Shuffle deterministically for reproducibility
     np.random.seed(42)
     np.random.shuffle(common_ids)
 
-    # Split point: e.g. 10% of 8091 = ~809 validation images
-    n_val = int(len(common_ids) * val_split)
+    n_val     = int(len(common_ids) * val_split)
     val_ids   = set(common_ids[:n_val])
     train_ids = set(common_ids[n_val:])
 
-    # Build split dictionaries
     train_captions = {k: captions_dict[k] for k in train_ids}
     val_captions   = {k: captions_dict[k] for k in val_ids}
     train_features = {k: features_dict[k] for k in train_ids}
@@ -404,15 +375,7 @@ def calculate_steps(captions_dict, features_dict, tokenizer, batch_size):
     """
     Calculate steps_per_epoch for model.fit().
 
-    steps_per_epoch tells Keras how many generator.yield() calls
-    constitute one full pass over the training data (one epoch).
-
-    Formula:
-        total_samples = sum of word-steps across all images
-        steps = ceil(total_samples / batch_size)
-
-    We count word-steps by summing (len(seq) - 1) for each caption,
-    where -1 is because the last token has no "next word" to predict.
+    steps_per_epoch = ceil(total_word_step_samples / batch_size)
 
     Args:
         captions_dict (dict): { image_id: [captions] }
@@ -430,8 +393,7 @@ def calculate_steps(captions_dict, features_dict, tokenizer, batch_size):
             continue
         for caption in captions_list:
             seq = tokenizer.texts_to_sequences([caption])[0]
-            # Each sequence of length n generates (n-1) training samples
-            total_samples += len(seq) - 1
+            total_samples += len(seq) - 1   # each sequence of length n → n-1 samples
 
     steps = int(np.ceil(total_samples / batch_size))
     print(f"[steps] Total word-step samples : {total_samples:,}")
@@ -440,22 +402,19 @@ def calculate_steps(captions_dict, features_dict, tokenizer, batch_size):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MAIN — quick sanity check
+# MAIN — sanity check
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
     """
     Load all data, build a small demonstration batch, and print shapes.
-    This verifies the full data pipeline before training starts.
+    Verifies the full data pipeline before training starts.
     """
-    BATCH_SIZE = 32
-
-    # Load all data artifacts produced by previous pipeline steps
+    # Load all data artifacts
     captions_dict = load_clean_captions(CLEAN_CAPTIONS_PATH)
     features_dict = load_features(FEATURES_PATH)
     tokenizer     = load_tokenizer(TOKENIZER_PATH)
 
-    # Compute derived constants
     vocab_size = len(tokenizer.word_index) + 1
     max_length = get_max_length(captions_dict)
 
@@ -463,30 +422,34 @@ def main():
     print(f"[config] max_length = {max_length}")
     print(f"[config] batch_size = {BATCH_SIZE}")
 
-    # Train/Val split
     train_caps, val_caps, train_feats, val_feats = get_train_val_split(
         captions_dict, features_dict, val_split=0.1
     )
 
-    # Calculate steps
     print("\n--- Training set ---")
     train_steps = calculate_steps(train_caps, train_feats, tokenizer, BATCH_SIZE)
     print("\n--- Validation set ---")
     val_steps = calculate_steps(val_caps, val_feats, tokenizer, BATCH_SIZE)
 
-    # Build the generator and pull ONE batch to verify shapes
+    # Pull one batch from the generator and verify shapes
     print("\n[verify] Pulling one batch from data_generator...")
     gen = data_generator(
         train_caps, train_feats, tokenizer, max_length, vocab_size, BATCH_SIZE
     )
     [X1_batch, X2_batch], y_batch = next(gen)
 
+    # Count unique image sources in the batch (diversity check)
+    unique_feats = len(set(tuple(x) for x in X1_batch[:, :10]))  # first 10 dims as proxy
+
     print(f"\n  X1_batch shape (image features) : {X1_batch.shape}")
-    # Expected: (32, 512)
+    # Expected: (64, 4096)
     print(f"  X2_batch shape (input sequences): {X2_batch.shape}")
-    # Expected: (32, 37)
-    print(f"  y_batch  shape (one-hot targets): {y_batch.shape}")
-    # Expected: (32, 8769)
+    # Expected: (64, max_length)
+    print(f"  y_batch  shape (sparse targets) : {y_batch.shape}")
+    # Expected: (64,)  — integer indices, not one-hot
+    print(f"  y_batch  dtype                  : {y_batch.dtype}")
+    # Expected: int32
+    print(f"  Unique feature vectors in batch : {unique_feats} (higher = more diverse)")
 
     print("\n" + "="*60)
     print("  DATA PREPROCESSING VERIFIED")
@@ -495,9 +458,9 @@ def main():
     print(f"  Val   images       : {len(val_caps)}")
     print(f"  Train steps/epoch  : {train_steps}")
     print(f"  Val   steps/epoch  : {val_steps}")
-    print(f"  Batch shape [X1]   : {X1_batch.shape}")
-    print(f"  Batch shape [X2]   : {X2_batch.shape}")
-    print(f"  Batch shape [y ]   : {y_batch.shape}")
+    print(f"  Batch shape [X1]   : {X1_batch.shape}")   # (64, 4096)
+    print(f"  Batch shape [X2]   : {X2_batch.shape}")   # (64, max_length)
+    print(f"  Batch shape [y ]   : {y_batch.shape}")    # (64,)
     print("="*60)
     print("\nNext step -> run src/train.py")
 

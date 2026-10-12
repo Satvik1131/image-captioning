@@ -2,69 +2,69 @@
 src/feature_extraction.py
 ===========================
 STEP 2 of the Image Captioning Pipeline:
-    Load images → Preprocess for VGG16 → Extract 512-dim feature vectors →
-    Save {image_id: feature_vector} dict to data/processed/features.pkl
+    Load images → Preprocess for VGG16 → Extract 4096-dim fc2 feature vectors →
+    L2-normalise every vector → Save {image_id: feature_vector} dict to
+    data/processed/features.pkl
+
+WHY fc2 INSTEAD OF pooling='avg'?
+──────────────────────────────────
+VGG16(include_top=False, pooling='avg') gives a 512-dim Global Average Pooling
+vector. While compact, it discards the learned semantic representations from
+VGG16's fully-connected layers (fc1, fc2) that were trained to distinguish
+between 1000 ImageNet categories. The fc2 layer output (4096-d) carries richer,
+more discriminative image semantics that give the LSTM decoder a much stronger
+visual signal to condition on.
+
+WHY L2-NORMALISE?
+─────────────────
+Raw fc2 activations can have very different magnitudes across images (range:
+tens to thousands). L2-normalisation maps every vector to the unit hypersphere
+so cosine similarity == dot product, making the feature space more uniform and
+preventing large-magnitude images from dominating the loss.
+
+VGG16 Architecture Summary:
+    Input image    : (224, 224, 3)
+    ... 5 conv blocks → (7, 7, 512) feature maps ...
+    Flatten        : (25088,)
+    fc1 (Dense 4096, relu)
+    fc2 (Dense 4096, relu)   ← we extract from HERE
+    predictions (Dense 1000, softmax)  ← discarded
 
 Syllabus Alignment:
-    - Unit IV : Convolutions & Pooling — VGG16 is a 16-layer deep CNN that uses
-                repeated 3x3 convolution + 2x2 max-pooling blocks to extract
-                hierarchical spatial features from raw pixel input.
-    - Unit III: Transfer Learning / Dropout — we freeze VGG16 weights (trained
-                on ImageNet) and use it purely as a feature extractor, avoiding
-                the need to train a CNN from scratch.
-
-VGG16 Architecture Summary (what happens to each image):
-    Input image   : (224, 224, 3)   — 3-channel RGB, resized to 224x224
-    After Block 1 : (112, 112, 64)  — 2x Conv2D(64) + MaxPool
-    After Block 2 : (56,  56,  128) — 2x Conv2D(128) + MaxPool
-    After Block 3 : (28,  28,  256) — 3x Conv2D(256) + MaxPool
-    After Block 4 : (14,  14,  512) — 3x Conv2D(512) + MaxPool
-    After Block 5 : (7,   7,   512) — 3x Conv2D(512) + MaxPool
-    Global Avg Pool: (512,)         — average each 7x7 feature map → 1 scalar
-    OUTPUT        : (512,)          — the image feature vector we save
-
-    With include_top=False + pooling='avg' Keras does blocks 1-5 + GAP for us.
-
-Output:
-    data/processed/features.pkl  — dict { "image_filename.jpg": np.array shape (512,) }
+    - Unit IV : Convolutions & Pooling — VGG16's conv blocks
+    - Unit III: Transfer Learning — frozen ImageNet weights reused as extractor
 """
 
 import os
 import pickle
 
 import numpy as np
-from PIL import Image                               # Pillow: load .jpg files
-from tqdm import tqdm                               # progress bar per image
+from PIL import Image
+from tqdm import tqdm
 
-from tensorflow.keras.applications import VGG16                       # Unit IV: CNN
-from tensorflow.keras.applications.vgg16 import preprocess_input      # VGG16 pixel normalisation
-from tensorflow.keras.preprocessing.image import img_to_array         # PIL → numpy array
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.applications.vgg16 import preprocess_input
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing.image import img_to_array
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Absolute project root — derive all paths from here
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# Image dataset folder
-# NOTE: The original Flickr8k zip unpacks to "Flicker8k_Dataset" (typo in dataset name)
-# We check both spellings and also data/images/ as a fallback
+# Handles Flickr8k folder-name variants across download sources
 IMAGE_DIR_OPTIONS = [
-    os.path.join(PROJECT_ROOT, "data", "Flickr8k_Dataset", "Flicker8k_Dataset"),  # primary
-    os.path.join(PROJECT_ROOT, "data", "Flickr8k_Dataset", "Flickr8k_Dataset"),   # correct spelling
-    os.path.join(PROJECT_ROOT, "data", "images"),                                  # fallback
+    os.path.join(PROJECT_ROOT, "data", "Flickr8k_Dataset", "Flicker8k_Dataset"),
+    os.path.join(PROJECT_ROOT, "data", "Flickr8k_Dataset", "Flickr8k_Dataset"),
+    os.path.join(PROJECT_ROOT, "data", "images"),
 ]
 
-# Output paths
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 FEATURES_PATH = os.path.join(PROCESSED_DIR, "features.pkl")
 
-# VGG16 input size — the network was trained on 224x224 images; all inputs must match
-IMG_SIZE = (224, 224)
-
-# Print a progress log every N images (keeps the console readable)
-LOG_EVERY_N = 500
+IMG_SIZE     = (224, 224)   # VGG16 required input size
+LOG_EVERY_N  = 500          # console log frequency
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,9 +75,8 @@ def resolve_image_dir(candidates):
     """
     Find the first existing image directory from a list of candidate paths.
 
-    This handles the common issue where the Flickr8k dataset is downloaded
-    from different sources (Kaggle vs official) and unpacked with slightly
-    different folder names.
+    Handles the Flickr8k dataset folder-name inconsistency across download
+    sources (Kaggle vs official zip — "Flicker" vs "Flickr" typo).
 
     Args:
         candidates (list of str): Ordered list of paths to check.
@@ -106,49 +105,40 @@ def resolve_image_dir(candidates):
 
 def load_vgg16_model():
     """
-    Load VGG16 pre-trained on ImageNet, configured as a feature extractor.
+    Build a VGG16 feature extractor that outputs the fc2 layer (4096-d).
 
-    Key parameters explained:
-        weights='imagenet'    — Use weights learned on 1.2M ImageNet images.
-                                These low/mid-level feature detectors (edges,
-                                textures, shapes) transfer well to new images.
-        include_top=False     — Discard the final 3 fully-connected layers
-                                (the "classifier head"). We only want the
-                                convolutional feature maps.
-        pooling='avg'         — After the last conv block (7x7x512), apply
-                                Global Average Pooling: average each of the
-                                512 feature maps → output shape (512,).
-                                This replaces the flattened 25088-dim vector
-                                with a compact, fixed-size representation.
+    Configuration:
+        weights='imagenet'  — full VGG16 weights including the Dense classifier
+        include_top=True    — keep the Dense fc1 + fc2 layers
+        (no pooling arg needed when include_top=True)
 
-    Input  shape : (batch, 224, 224, 3)
-    Output shape : (batch, 512)          ← this is our image feature vector
+    We then build a sub-model whose output is the 'fc2' layer activation
+    (before the final softmax classifier). This gives a 4096-dim vector that
+    encodes rich, discriminative image semantics learned from 1.2M images.
 
-    Unit IV connection:
-        VGG16's 13 conv layers repeatedly apply:
-            Conv2D(filters, kernel=3x3, padding='same', activation='relu')
-        followed by:
-            MaxPooling2D(pool_size=2x2, strides=2)
-        This halves the spatial dimensions at each pooling step while doubling
-        the depth, building increasingly abstract feature representations.
+    The sub-model weights are frozen — forward-pass only.
 
     Returns:
-        model (tf.keras.Model): VGG16 feature extractor, weights frozen.
+        tf.keras.Model: Extractor with output shape (None, 4096).
     """
-    print("[model] Loading VGG16 with ImageNet weights (feature extractor mode)...")
+    print("[model] Loading VGG16 (include_top=True) for fc2 feature extraction...")
 
-    model = VGG16(
-        weights='imagenet',   # download/use cached ImageNet weights (~550MB first run)
-        include_top=False,    # drop the Dense(1000) classification head
-        pooling='avg'         # Global Average Pooling → output shape: (512,)
+    base = VGG16(
+        weights='imagenet',
+        include_top=True,          # keep the Dense classification head
+        input_shape=(224, 224, 3)  # must be specified when include_top=True
     )
 
-    # Freeze all weights — we are NOT training VGG16, only using it to extract features
-    # This means no gradients will be computed through VGG16 during training
-    model.trainable = False
+    # Build sub-model: input → fc2 output (4096-d)
+    model = Model(
+        inputs=base.input,
+        outputs=base.get_layer('fc2').output,
+        name='vgg16_fc2_extractor'
+    )
 
-    print(f"[model] VGG16 loaded. Output shape per image: {model.output_shape}")
-    # Expected: (None, 512)  — None = variable batch size, 512 = feature vector dim
+    model.trainable = False   # freeze — inference only
+    print(f"[model] VGG16 fc2 extractor ready. Output shape: {model.output_shape}")
+    # Expected: (None, 4096)
     return model
 
 
@@ -158,148 +148,175 @@ def load_vgg16_model():
 
 def preprocess_image(image_path):
     """
-    Load a single image from disk and prepare it for VGG16 inference.
+    Load a single image and prepare it for VGG16 inference.
 
-    Preprocessing pipeline:
-        1. Open with PIL  → RGB image of any size
-        2. Resize         → exactly (224, 224) pixels  [VGG16 requirement]
-        3. img_to_array   → numpy array of shape (224, 224, 3), dtype float32
-        4. expand_dims    → shape (1, 224, 224, 3)     [add batch dimension]
-        5. preprocess_input → normalise pixel values using VGG16's own stats:
-                              subtracts the ImageNet mean per channel
-                              [R: -103.939, G: -116.779, B: -123.68]
-                              and converts RGB → BGR (VGG16 was trained this way)
+    Preprocessing pipeline (must match predict.py):
+        1. Open with PIL        → RGB image, any size
+        2. Resize to (224, 224) → VGG16 required input size
+        3. img_to_array         → numpy (224, 224, 3) float32
+        4. expand_dims          → (1, 224, 224, 3) batch tensor
+        5. preprocess_input     → subtract ImageNet per-channel mean + BGR swap
 
     Args:
         image_path (str): Absolute path to a .jpg image file.
 
     Returns:
-        np.ndarray: Preprocessed image tensor, shape (1, 224, 224, 3).
-                    Ready to be passed to model.predict().
-
-    Returns None if the image cannot be opened (corrupted / missing file).
+        np.ndarray of shape (1, 224, 224, 3), or None on error.
     """
     try:
-        # Step 1+2: Open and resize
-        img = Image.open(image_path).convert('RGB')  # ensure 3 channels (not RGBA/grayscale)
-        img = img.resize(IMG_SIZE)                   # → (224, 224) PIL Image
-
-        # Step 3: Convert PIL Image → numpy array
-        # Shape becomes: (224, 224, 3) — height × width × channels
+        img = Image.open(image_path).convert('RGB')
+        img = img.resize(IMG_SIZE)
         img_array = img_to_array(img)
-
-        # Step 4: Add batch dimension → (1, 224, 224, 3)
-        # model.predict() always expects a BATCH even if it's a single image
         img_array = np.expand_dims(img_array, axis=0)
-
-        # Step 5: Apply VGG16-specific pixel normalisation
-        # Without this, the model receives out-of-distribution pixel values
-        # and the extracted features are meaningless
         img_array = preprocess_input(img_array)
-
-        return img_array  # shape: (1, 224, 224, 3)
-
+        return img_array
     except Exception as e:
-        print(f"  [warn] Could not process image {os.path.basename(image_path)}: {e}")
+        print(f"  [warn] Could not process {os.path.basename(image_path)}: {e}")
         return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FUNCTION 4 — extract_features
+# FUNCTION 4 — l2_normalize
+# ──────────────────────────────────────────────────────────────────────────────
+
+def l2_normalize(vector):
+    """
+    L2-normalise a feature vector to unit length.
+
+    v_norm = v / (||v||_2 + eps)
+
+    Adding eps=1e-8 prevents division by zero for all-zero vectors (degenerate
+    case that should never occur with real images but is safe to guard against).
+
+    After normalisation:
+        ||v_norm||_2 ≈ 1.0 for every image
+        cosine_similarity(a, b) == dot(a, b)  ← makes similarity well-defined
+
+    Args:
+        vector (np.ndarray): Feature vector of any shape.
+
+    Returns:
+        np.ndarray: Unit-length vector of the same shape.
+    """
+    norm = np.linalg.norm(vector)
+    return vector / (norm + 1e-8)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FUNCTION 5 — extract_features
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract_features(model, image_dir):
     """
-    Iterate over all .jpg images, run VGG16 inference, collect feature vectors.
+    Iterate over all .jpg images, run VGG16 fc2 inference, L2-normalise,
+    and collect feature vectors.
 
     For each image:
         preprocessed tensor (1, 224, 224, 3)
-            → VGG16 forward pass
-            → feature vector (1, 512)
-            → squeeze → (512,)
-            → store in dict with image filename as key
+            → VGG16 fc2 forward pass
+            → (1, 4096) raw feature
+            → squeeze → (4096,)
+            → L2-normalise → (4096,) on unit sphere
+            → store with filename as key
 
     Args:
-        model     : Loaded VGG16 Keras model (output shape per image: (512,))
+        model     : VGG16 fc2 extractor (output shape: (None, 4096))
         image_dir : Directory containing .jpg image files
 
     Returns:
-        dict: { "1000268201_693b08cb0e.jpg": np.array of shape (512,), ... }
+        dict: { "1000268201_693b08cb0e.jpg": np.array of shape (4096,) }
     """
-    # Collect all .jpg files in the image directory
-    all_images = [
+    all_images = sorted([
         f for f in os.listdir(image_dir)
         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
-    ]
-    all_images.sort()  # deterministic ordering
+    ])
 
-    total = len(all_images)
+    total   = len(all_images)
+    skipped = 0
     print(f"[extract] Found {total} image files in: {image_dir}")
-    print(f"[extract] Starting VGG16 feature extraction... (logs every {LOG_EVERY_N} images)\n")
+    print(f"[extract] Extracting VGG16 fc2 features (4096-d) with L2 normalisation...\n")
 
-    features = {}   # will hold { image_filename: feature_vector (512,) }
-    skipped  = 0    # count of images we couldn't process
+    features = {}
 
-    # tqdm wraps the list and draws a live progress bar in the terminal
     for idx, filename in enumerate(tqdm(all_images, desc="Extracting features", unit="img"), start=1):
-
         image_path = os.path.join(image_dir, filename)
-
-        # Preprocess: resize + normalise → shape (1, 224, 224, 3)
         img_tensor = preprocess_image(image_path)
 
         if img_tensor is None:
             skipped += 1
-            continue  # skip corrupted / unreadable images
+            continue
 
-        # Run the forward pass through VGG16
-        # model.predict() returns shape (1, 512) — batch of 1 image
+        # Forward pass → (1, 4096)
         feature_vector = model.predict(img_tensor, verbose=0)
+        feature_vector = feature_vector.squeeze()   # (4096,)
 
-        # Remove the batch dimension: (1, 512) → (512,)
-        # This is the compact image representation the LSTM decoder will use
-        feature_vector = feature_vector.squeeze()  # shape: (512,)
+        # L2-normalise to unit sphere
+        feature_vector = l2_normalize(feature_vector)
 
-        # Store using the filename as key — matches keys in clean_captions.json
         features[filename] = feature_vector
 
-        # ── Progress log every LOG_EVERY_N images ─────────────────────────────
         if idx % LOG_EVERY_N == 0 or idx == total:
-            print(f"\n  [progress] {idx}/{total} images processed "
-                  f"| {len(features)} features collected "
-                  f"| {skipped} skipped")
+            print(f"\n  [progress] {idx}/{total} | features={len(features)} | skipped={skipped}")
 
-    print(f"\n[extract] Done. {len(features)} feature vectors extracted.")
+    print(f"\n[extract] Done. {len(features)} feature vectors extracted (4096-d, L2-normalised).")
     if skipped:
-        print(f"[extract] Warning: {skipped} images were skipped (corrupted or unreadable).")
+        print(f"[extract] Warning: {skipped} images skipped (corrupted or unreadable).")
 
     return features
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FUNCTION 5 — save_features
+# FUNCTION 6 — verify_features
+# ──────────────────────────────────────────────────────────────────────────────
+
+def verify_features(features, n_pairs=100):
+    """
+    Print verification statistics to confirm features are image-specific.
+
+    Checks:
+        1. Feature shape == (4096,)
+        2. L2 norm ≈ 1.0
+        3. Mean cosine similarity between random pairs << 0.9
+           (if all captions were identical, this would approach 1.0)
+
+    Args:
+        features (dict): { image_id: np.array(4096,) }
+        n_pairs (int)  : Number of random image pairs to sample for similarity.
+    """
+    keys = list(features.keys())
+    sample_vec = features[keys[0]]
+
+    print(f"\n[verify] Feature shape      : {sample_vec.shape}")   # expect (4096,)
+    print(f"[verify] Sample L2 norm     : {np.linalg.norm(sample_vec):.6f}")  # expect ~1.0
+
+    # Sample n_pairs random pairs and compute cosine similarity
+    np.random.seed(0)
+    sims = []
+    for _ in range(n_pairs):
+        i, j = np.random.choice(len(keys), 2, replace=False)
+        a = features[keys[i]]
+        b = features[keys[j]]
+        sims.append(float(np.dot(a, b)))  # dot of unit vectors == cosine sim
+
+    mean_sim = np.mean(sims)
+    print(f"[verify] Mean cosine similarity over {n_pairs} random pairs: {mean_sim:.4f}")
+    print(f"         (Should be clearly below 0.9 — if ~1.0, features are degenerate)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FUNCTION 7 — save_features
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_features(features, path):
     """
     Save the extracted feature dictionary to disk using pickle.
 
-    Why pickle?
-        The dictionary values are numpy arrays (float32, shape 512).
-        Pickle serialises numpy arrays efficiently in binary format.
-        Loading back with pickle.load() restores the exact numpy arrays.
-
     File size estimate:
-        8092 images × 512 floats × 4 bytes = ~16.6 MB
-
-    This file is loaded by:
-        - data_preprocessing.py (merge features + captions into training pairs)
-        - predict.py            (extract feature for a new query image at inference)
-        - app/app.py            (real-time feature extraction in the Streamlit UI)
+        8092 images × 4096 floats × 4 bytes = ~133 MB
 
     Args:
-        features (dict) : { image_id: np.array(512,) }
-        path (str)      : Absolute path to save the .pkl file
+        features (dict): { image_id: np.array(4096,) }
+        path (str)     : Absolute path to save the .pkl file
     """
     with open(path, "wb") as f:
         pickle.dump(features, f)
@@ -318,45 +335,40 @@ def main():
 
         1. Create output directories
         2. Resolve the image directory path
-        3. Load VGG16 as a feature extractor (include_top=False, pooling='avg')
-        4. Preprocess and extract a 512-dim vector for every image
-        5. Save the features dict to data/processed/features.pkl
+        3. Load VGG16 with include_top=True, build fc2 (4096-d) sub-model
+        4. Preprocess and extract a 4096-dim vector for every image
+        5. L2-normalise each vector
+        6. Verify feature statistics (shape, norm, pairwise similarity)
+        7. Save the features dict to data/processed/features.pkl
 
     Runtime estimate:
-        ~8092 images, CPU-only: 15–40 minutes depending on hardware.
-        With GPU: ~2–5 minutes.
-        The tqdm bar + LOG_EVERY_N logs keep you informed of progress.
+        ~8092 images on CPU: 20–50 minutes (fc2 is deeper than GAP).
+        With GPU: ~3–8 minutes.
     """
-
-    # -- Step 0: Ensure output directory exists --------------------------------
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     print("[init] Output directories confirmed.\n")
 
-    # -- Step 1: Locate the image directory ------------------------------------
     image_dir = resolve_image_dir(IMAGE_DIR_OPTIONS)
+    model     = load_vgg16_model()
 
-    # -- Step 2: Load VGG16 model ---------------------------------------------
-    model = load_vgg16_model()
+    features  = extract_features(model, image_dir)
 
-    # Quick sanity check — print first layer and last layer names
-    print(f"[model] First layer : {model.layers[0].name}")
-    print(f"[model] Last layer  : {model.layers[-1].name}\n")
+    # ── Verification ──────────────────────────────────────────────────────────
+    verify_features(features, n_pairs=100)
 
-    # -- Step 3: Extract features for all images --------------------------------
-    features = extract_features(model, image_dir)
-
-    # -- Step 4: Save to disk --------------------------------------------------
+    # ── Save ──────────────────────────────────────────────────────────────────
     save_features(features, FEATURES_PATH)
 
-    # -- Step 5: Summary -------------------------------------------------------
     print("\n" + "="*60)
     print("  FEATURE EXTRACTION COMPLETE")
     print("="*60)
     print(f"  Images extracted   : {len(features)}")
-    print(f"  Feature shape      : {next(iter(features.values())).shape}")
+    sample = next(iter(features.values()))
+    print(f"  Feature shape      : {sample.shape}")   # (4096,)
+    print(f"  L2 norm (sample)   : {np.linalg.norm(sample):.6f}")  # ~1.0
     print(f"  Features saved     : {FEATURES_PATH}")
     print("="*60)
-    print("\nNext step -> run src/data_preprocessing.py")
+    print("\nNext step -> run src/caption_preprocessing.py (if not done) then src/train.py")
 
 
 if __name__ == "__main__":
