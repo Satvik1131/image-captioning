@@ -75,7 +75,7 @@ IMAGE_DIR_OPTIONS = [
     os.path.join(PROJECT_ROOT, "data", "images"),
 ]
 
-DEFAULT_BEAM_WIDTH = 3          # default beam width for beam_search_caption
+DEFAULT_BEAM_WIDTH = 5          # default beam width for beam_search_caption
 MAX_REPEAT_COUNT   = 3          # stop if same word repeated this many times in a row
 
 
@@ -299,10 +299,16 @@ def generate_caption(caption_model, tokenizer, image_feature, max_length):
         sequence = pad_sequences([sequence], maxlen=max_length, padding='post')
 
         y_pred = caption_model.predict(
-            {'image_input': image_feature, 'seq_input': sequence},
-            verbose=0
+        {'image_input': image_feature, 'seq_input': sequence},
+        verbose=0
         )
+        # --- NEW: never allow the 'unk' token ---
+        unk_idx = tokenizer.word_index.get('unk')
+        if unk_idx is not None:
+            y_pred[0][unk_idx] = 0.0
+        # ----------------------------------------
         next_word_idx = np.argmax(y_pred[0])
+
         next_word     = index_to_word.get(next_word_idx, None)
 
         if next_word is None:
@@ -379,9 +385,15 @@ def beam_search_caption(caption_model, tokenizer, image_feature, max_length,
             sequence = pad_sequences([sequence], maxlen=max_length, padding='post')
 
             y_pred = caption_model.predict(
-                {'image_input': image_feature, 'seq_input': sequence},
-                verbose=0
+            {'image_input': image_feature, 'seq_input': sequence},
+            verbose=0
             )[0]   # (vocab_size,)
+
+            # --- NEW: never allow the 'unk' token ---
+            unk_idx = tokenizer.word_index.get('unk')
+            if unk_idx is not None:
+                y_pred[unk_idx] = 0.0
+            # ----------------------------------------
 
             # Take top beam_width candidates to limit expansion
             top_indices = np.argsort(y_pred)[-beam_width:]
