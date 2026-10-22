@@ -1,34 +1,35 @@
 # ============================================================
-# Image Captioning Project — Dependencies
-# VGG16 (CNN Encoder) + LSTM (RNN Decoder) on Flickr8k
+# Image Captioning Project - Dependencies
+# InceptionV3 (CNN encoder) + LSTM (RNN decoder)
+# Trained on Flickr8k and on MS-COCO 2017
 # ============================================================
 
-# Core deep learning framework (Unit II, IV, V)
-tensorflow==2.21.0       # TensorFlow + Keras: VGG16, LSTM, Adam, Cross-Entropy
+# Core deep learning framework
+tensorflow==2.21.0       # TensorFlow + Keras: InceptionV3, LSTM, Adam, cross-entropy
 
-# Numerical computing — array ops, feature matrix manipulation
+# Numerical computing - array ops, feature matrices
 numpy==2.4.6
 
-# Image loading and resizing for VGG16 preprocessing (Unit IV)
-Pillow==12.3.0           # PIL: load .jpg images, resize to 224x224
+# Image loading and resizing for InceptionV3 preprocessing
+Pillow==12.3.0           # PIL: load images, resize to 299x299
 
-# Progress bars for feature extraction loop (nice-to-have)
-tqdm                     # shows progress during VGG16 feature extraction
+# Progress bars for the feature extraction loop (nice-to-have)
+tqdm                     # shows progress during feature extraction
 
-# Evaluation metric: BLEU score (Unit V — sequence evaluation)
+# Evaluation metric: BLEU score
 nltk                     # Natural Language Toolkit: corpus_bleu()
 
-# Optional: BLEU/ROUGE scoring utilities
-scikit-learn             # train/val split helpers (train_test_split)
+# Optional: train/val split helpers
+scikit-learn
 
 # Optional: read images with OpenCV if PIL fails
-opencv-python            # cv2: alternative image loading
+opencv-python
 
-# Visualisation — loss/accuracy curves, image display
+# Visualisation - loss/accuracy curves, image display
 matplotlib==3.11.2
 
-# Web UI (Streamlit app — app/app.py)
+# Web UI (Streamlit app - app/app.py)
 streamlit==1.64.0
 
 # Model weights storage format
-h5py==3.14.0             # HDF5: saves Keras model weights (.h5 files)
+h5py==3.14.0             # HDF5: Keras model files (.h5)

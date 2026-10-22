@@ -36,16 +36,18 @@ Syllabus Alignment:
 """
 
 import os
+import sys
 import pickle
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.applications.vgg16 import preprocess_input
-from tensorflow.keras.models import Model
 from tensorflow.keras.preprocessing.image import img_to_array
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from encoder import (build_encoder, preprocess as preprocess_input,
+                     IMG_SIZE, FEATURE_DIM, ENCODER_NAME)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -63,7 +65,6 @@ IMAGE_DIR_OPTIONS = [
 PROCESSED_DIR = os.path.join(PROJECT_ROOT, "data", "processed")
 FEATURES_PATH = os.path.join(PROCESSED_DIR, "features.pkl")
 
-IMG_SIZE     = (224, 224)   # VGG16 required input size
 LOG_EVERY_N  = 500          # console log frequency
 
 
@@ -105,40 +106,12 @@ def resolve_image_dir(candidates):
 
 def load_vgg16_model():
     """
-    Build a VGG16 feature extractor that outputs the fc2 layer (4096-d).
-
-    Configuration:
-        weights='imagenet'  — full VGG16 weights including the Dense classifier
-        include_top=True    — keep the Dense fc1 + fc2 layers
-        (no pooling arg needed when include_top=True)
-
-    We then build a sub-model whose output is the 'fc2' layer activation
-    (before the final softmax classifier). This gives a 4096-dim vector that
-    encodes rich, discriminative image semantics learned from 1.2M images.
-
-    The sub-model weights are frozen — forward-pass only.
-
-    Returns:
-        tf.keras.Model: Extractor with output shape (None, 4096).
+    Kept under the old name so main() and other scripts still work, but this now
+    returns the InceptionV3 encoder defined in src/encoder.py (output: 2048-d).
     """
-    print("[model] Loading VGG16 (include_top=True) for fc2 feature extraction...")
-
-    base = VGG16(
-        weights='imagenet',
-        include_top=True,          # keep the Dense classification head
-        input_shape=(224, 224, 3)  # must be specified when include_top=True
-    )
-
-    # Build sub-model: input → fc2 output (4096-d)
-    model = Model(
-        inputs=base.input,
-        outputs=base.get_layer('fc2').output,
-        name='vgg16_fc2_extractor'
-    )
-
-    model.trainable = False   # freeze — inference only
-    print(f"[model] VGG16 fc2 extractor ready. Output shape: {model.output_shape}")
-    # Expected: (None, 4096)
+    print(f"[model] Loading {ENCODER_NAME} encoder (ImageNet weights)...")
+    model = build_encoder()
+    print(f"[model] Encoder ready. Output shape: {model.output_shape}")   # (None, 2048)
     return model
 
 
@@ -234,7 +207,7 @@ def extract_features(model, image_dir):
     total   = len(all_images)
     skipped = 0
     print(f"[extract] Found {total} image files in: {image_dir}")
-    print(f"[extract] Extracting VGG16 fc2 features (4096-d) with L2 normalisation...\n")
+    print(f"[extract] Extracting {ENCODER_NAME} features ({FEATURE_DIM}-d) with L2 normalisation...\n")
 
     features = {}
 
@@ -248,7 +221,7 @@ def extract_features(model, image_dir):
 
         # Forward pass → (1, 4096)
         feature_vector = model.predict(img_tensor, verbose=0)
-        feature_vector = feature_vector.squeeze()   # (4096,)
+        feature_vector = feature_vector.squeeze()   # (2048,)
 
         # L2-normalise to unit sphere
         feature_vector = l2_normalize(feature_vector)
@@ -258,7 +231,7 @@ def extract_features(model, image_dir):
         if idx % LOG_EVERY_N == 0 or idx == total:
             print(f"\n  [progress] {idx}/{total} | features={len(features)} | skipped={skipped}")
 
-    print(f"\n[extract] Done. {len(features)} feature vectors extracted (4096-d, L2-normalised).")
+    print(f"\n[extract] Done. {len(features)} feature vectors extracted ({FEATURE_DIM}-d, L2-normalised).")
     if skipped:
         print(f"[extract] Warning: {skipped} images skipped (corrupted or unreadable).")
 
@@ -286,7 +259,7 @@ def verify_features(features, n_pairs=100):
     keys = list(features.keys())
     sample_vec = features[keys[0]]
 
-    print(f"\n[verify] Feature shape      : {sample_vec.shape}")   # expect (4096,)
+    print(f"\n[verify] Feature shape      : {sample_vec.shape}")   # expect (2048,)
     print(f"[verify] Sample L2 norm     : {np.linalg.norm(sample_vec):.6f}")  # expect ~1.0
 
     # Sample n_pairs random pairs and compute cosine similarity
@@ -364,7 +337,7 @@ def main():
     print("="*60)
     print(f"  Images extracted   : {len(features)}")
     sample = next(iter(features.values()))
-    print(f"  Feature shape      : {sample.shape}")   # (4096,)
+    print(f"  Feature shape      : {sample.shape}")   # (2048,)
     print(f"  L2 norm (sample)   : {np.linalg.norm(sample):.6f}")  # ~1.0
     print(f"  Features saved     : {FEATURES_PATH}")
     print("="*60)

@@ -47,9 +47,6 @@ import numpy as np
 from PIL import Image
 
 import tensorflow as tf
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.applications.vgg16 import preprocess_input
-from tensorflow.keras.models import Model
 from tensorflow.keras.preprocessing.image import img_to_array
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
@@ -58,6 +55,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.model import build_model
+from src.encoder import build_encoder, preprocess as preprocess_input, IMG_SIZE, ENCODER_NAME
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -67,7 +65,6 @@ MODELS_DIR         = os.path.join(PROJECT_ROOT, "models")
 CAPTION_MODEL_PATH = os.path.join(MODELS_DIR, "caption_model.h5")
 TOKENIZER_PATH     = os.path.join(MODELS_DIR, "tokenizer.pkl")
 
-IMG_SIZE = (224, 224)   # VGG16 required input size
 
 IMAGE_DIR_OPTIONS = [
     os.path.join(PROJECT_ROOT, "data", "Flickr8k_Dataset", "Flicker8k_Dataset"),
@@ -90,6 +87,15 @@ def _read_max_length_from_h5(path):
     Returns:
         int | None: The max_length if found, else None.
     """
+    # FIRST choice: meta.json saved next to the model by the COCO training pipeline
+    meta_path = os.path.join(os.path.dirname(path), "meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                return int(json.load(mf)["max_length"])
+        except Exception as exc:
+            print(f"[warn] Could not read max_length from meta.json: {exc}")
+
     try:
         with h5py.File(path, 'r') as f:
             raw = f.attrs.get('model_config', None)
@@ -188,36 +194,12 @@ def load_tokenizer(path):
 
 def build_feature_extractor():
     """
-    Build the VGG16 fc2 feature extractor — IDENTICAL to feature_extraction.py.
-
-    Configuration:
-        weights='imagenet'  — full pretrained VGG16 including Dense layers
-        include_top=True    — keep fc1 and fc2 Dense layers
-        Sub-model output    — fc2 layer (4096-d)
-
-    Input  shape: (batch, 224, 224, 3)
-    Output shape: (batch, 4096)
-
-    IMPORTANT: must match the extractor used during training exactly.
-    Using the wrong extractor (e.g., pooling='avg' → 512-d) would produce
-    features from a completely different distribution → garbage captions.
-
-    Returns:
-        tf.keras.Model: VGG16 fc2 extractor, output shape (None, 4096).
+    Build the image encoder -- IDENTICAL to the one used in feature_extraction.py
+    (both import it from src/encoder.py). Output shape: (None, 2048).
     """
-    print("[model] Building VGG16 fc2 feature extractor (ImageNet weights)...")
-    base = VGG16(
-        weights='imagenet',
-        include_top=True,
-        input_shape=(224, 224, 3)
-    )
-    extractor = Model(
-        inputs=base.input,
-        outputs=base.get_layer('fc2').output,
-        name='vgg16_fc2_extractor'
-    )
-    extractor.trainable = False
-    print(f"[model] VGG16 fc2 extractor ready. Output shape: {extractor.output_shape}")
+    print(f"[model] Building {ENCODER_NAME} feature extractor (ImageNet weights)...")
+    extractor = build_encoder()
+    print(f"[model] Extractor ready. Output shape: {extractor.output_shape}")
     return extractor
 
 
@@ -255,7 +237,7 @@ def extract_image_feature(vgg_model, image_path):
     img_array = np.expand_dims(img_array, axis=0)
     img_array = preprocess_input(img_array)
 
-    feature = vgg_model.predict(img_array, verbose=0)   # (1, 4096)
+    feature = vgg_model.predict(img_array, verbose=0)   # (1, 2048)
 
     # L2-normalise — MUST match training preprocessing
     norm    = np.linalg.norm(feature) + 1e-8
@@ -299,16 +281,13 @@ def generate_caption(caption_model, tokenizer, image_feature, max_length):
         sequence = pad_sequences([sequence], maxlen=max_length, padding='post')
 
         y_pred = caption_model.predict(
-        {'image_input': image_feature, 'seq_input': sequence},
-        verbose=0
+            {'image_input': image_feature, 'seq_input': sequence},
+            verbose=0
         )
-        # --- NEW: never allow the 'unk' token ---
         unk_idx = tokenizer.word_index.get('unk')
         if unk_idx is not None:
             y_pred[0][unk_idx] = 0.0
-        # ----------------------------------------
         next_word_idx = np.argmax(y_pred[0])
-
         next_word     = index_to_word.get(next_word_idx, None)
 
         if next_word is None:
@@ -385,15 +364,13 @@ def beam_search_caption(caption_model, tokenizer, image_feature, max_length,
             sequence = pad_sequences([sequence], maxlen=max_length, padding='post')
 
             y_pred = caption_model.predict(
-            {'image_input': image_feature, 'seq_input': sequence},
-            verbose=0
+                {'image_input': image_feature, 'seq_input': sequence},
+                verbose=0
             )[0]   # (vocab_size,)
 
-            # --- NEW: never allow the 'unk' token ---
             unk_idx = tokenizer.word_index.get('unk')
             if unk_idx is not None:
                 y_pred[unk_idx] = 0.0
-            # ----------------------------------------
 
             # Take top beam_width candidates to limit expansion
             top_indices = np.argsort(y_pred)[-beam_width:]

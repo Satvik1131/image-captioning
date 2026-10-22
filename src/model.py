@@ -61,8 +61,14 @@ from tensorflow.keras.layers import (
     Embedding,
     LSTM,
     add,
+    Rescaling,
+    LayerNormalization,
 )
 from tensorflow.keras.optimizers import Adam
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from encoder import FEATURE_DIM
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -100,17 +106,18 @@ def build_model(vocab_size, max_length):
     # VGG16 fc2 output: 4096-dim L2-normalised vector per image.
     # VGG16 itself is NOT part of this model; we use pre-extracted pkl features.
 
-    image_input = Input(shape=(4096,), name='image_input')
-    # shape: (batch, 4096)
+    image_input = Input(shape=(FEATURE_DIM,), name='image_input')
+    # shape: (batch, FEATURE_DIM)  -- L2-normalised, so each value is only ~1/sqrt(dim)
 
-    # Dense FIRST — compress 4096-d fc2 space → 256-d shared space
-    # relu activation: f(x) = max(0, x)
-    image_dense = Dense(256, activation='relu', name='image_dense')(image_input)
-    # shape: (batch, 256)
+    # RESCALE: an L2-normalised vector has tiny per-element values, which made the
+    # image branch ~10x weaker than the LSTM branch and let the language prior win.
+    # Multiplying by sqrt(dim) brings values back to ~1.
+    image_scaled = Rescaling(float(FEATURE_DIM) ** 0.5, name='image_rescale')(image_input)
 
-    # Dropout AFTER Dense — regularise the projected representation, not the raw input
-    # rate=0.3 (lighter than 0.5) because the fc2 features are already rich
-    image_out = Dropout(0.3, name='image_dropout')(image_dense)
+    image_dense = Dense(256, activation='relu', name='image_dense')(image_scaled)
+    # LayerNorm keeps both branches on the same scale before they are added
+    image_norm = LayerNormalization(name='image_ln')(image_dense)
+    image_out = Dropout(0.3, name='image_dropout')(image_norm)
     # shape: (batch, 256)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -140,6 +147,7 @@ def build_model(vocab_size, max_length):
     # which summarises the entire partial caption in a 256-dim vector.
     # units=256 matches the image Dense output for direct addition.
     seq_out = LSTM(256, name='caption_lstm')(seq_drop)
+    seq_out = LayerNormalization(name='seq_ln')(seq_out)
     # shape: (batch, 256)
 
     # ──────────────────────────────────────────────────────────────────────────

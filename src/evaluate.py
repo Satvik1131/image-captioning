@@ -9,7 +9,7 @@ from data_preprocessing import (load_clean_captions, load_features, load_tokeniz
                                 CLEAN_CAPTIONS_PATH, FEATURES_PATH, TOKENIZER_PATH)
 from predict import load_caption_model, CAPTION_MODEL_PATH
 
-N_IMAGES = 100      # raise to 300+ later once you see the speed
+N_IMAGES = 500     
 BEAM     = 3
 
 def fast_beam(model, tok, feat, maxlen, beam=BEAM):
