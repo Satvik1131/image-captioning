@@ -1,14 +1,26 @@
-# Ignore datasets and zip files
+# ---- datasets and archives ----
 data/
 *.zip
 *.tar.gz
 
-# Ignore processed data & trained model binaries
-data/processed/
-models/*.pkl
-models/*.h5
+# ---- trained models and large binary files (in ANY folder) ----
+*.h5
+*.keras
+*.pkl
+*.npy
+*.npz
 
-# Ignore virtual environments
+# ---- everything inside models/ (trained files stay local; models/.gitkeep keeps the folder) ----
+models/*
+!models/.gitkeep
+
+# ---- old backups and temporary folders ----
+old_vgg/
+colab_pack/
+
+# ---- virtual environments and caches ----
 venv/
 .venv/
 __pycache__/
+*.pyc
+.ipynb_checkpoints/
